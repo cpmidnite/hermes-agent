@@ -70,10 +70,17 @@ class PtyBridge:
     ``os.write`` on the master fd, which is safe.
     """
 
-    def __init__(self, proc: "ptyprocess.PtyProcess"):  # type: ignore[name-defined]
+    def __init__(
+        self,
+        proc: "ptyprocess.PtyProcess",  # type: ignore[name-defined]
+        *,
+        scrollback_bytes: int = 256 * 1024,
+    ):
         self._proc = proc
         self._fd: int = proc.fd
         self._closed = False
+        self._scrollback = bytearray()
+        self._scrollback_limit = max(0, int(scrollback_bytes))
 
     # -- lifecycle --------------------------------------------------------
 
@@ -91,6 +98,7 @@ class PtyBridge:
         env: Optional[dict] = None,
         cols: int = 80,
         rows: int = 24,
+        scrollback_bytes: int = 256 * 1024,
     ) -> "PtyBridge":
         """Spawn ``argv`` behind a new PTY and return a bridge.
 
@@ -125,7 +133,7 @@ class PtyBridge:
             env=spawn_env,
             dimensions=(rows, cols),
         )
-        return cls(proc)
+        return cls(proc, scrollback_bytes=scrollback_bytes)
 
     @property
     def pid(self) -> int:
@@ -140,6 +148,17 @@ class PtyBridge:
             return False
 
     # -- I/O --------------------------------------------------------------
+
+    def _append_scrollback(self, chunk: bytes) -> None:
+        if self._scrollback_limit <= 0 or not chunk:
+            return
+        self._scrollback.extend(chunk)
+        overflow = len(self._scrollback) - self._scrollback_limit
+        if overflow > 0:
+            del self._scrollback[:overflow]
+
+    def snapshot_scrollback(self) -> bytes:
+        return bytes(self._scrollback)
 
     def read(self, timeout: float = 0.2) -> Optional[bytes]:
         """Read up to 64 KiB of raw bytes from the PTY master.
@@ -169,6 +188,7 @@ class PtyBridge:
             raise
         if not data:
             return None
+        self._append_scrollback(data)
         return data
 
     def write(self, data: bytes) -> None:

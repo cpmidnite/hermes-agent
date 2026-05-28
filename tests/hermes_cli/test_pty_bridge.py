@@ -171,6 +171,40 @@ class TestPtyBridgeEnv:
             bridge.close()
 
 
+@skip_on_windows
+class TestScrollback:
+    def test_scrollback_collects_recent_bytes(self):
+        bridge = PtyBridge.spawn([shutil.which("cat") or "cat"])
+        try:
+            bridge.write(b"scrollback-known-bytes\n")
+            output = _read_until(bridge, b"scrollback-known-bytes")
+            assert b"scrollback-known-bytes" in output
+            assert b"scrollback-known-bytes" in bridge.snapshot_scrollback()
+        finally:
+            bridge.close()
+
+    def test_scrollback_trims_to_limit(self):
+        bridge = PtyBridge.spawn(
+            ["/bin/sh", "-c", "printf '1111122222333334444455555'"],
+            scrollback_bytes=10,
+        )
+        try:
+            output = _read_until(bridge, b"55555")
+            assert b"11111" in output
+            snapshot = bridge.snapshot_scrollback()
+            assert len(snapshot) <= 10
+            assert snapshot.endswith(b"4444455555")
+        finally:
+            bridge.close()
+
+    def test_scrollback_empty_after_spawn(self):
+        bridge = PtyBridge.spawn(["/bin/sh", "-c", "sleep 1"])
+        try:
+            assert bridge.snapshot_scrollback() == b""
+        finally:
+            bridge.close()
+
+
 class TestPtyBridgeUnavailable:
     """Platform fallback semantics — PtyUnavailableError is importable and
     carries a user-readable message."""

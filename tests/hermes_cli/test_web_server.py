@@ -2371,6 +2371,163 @@ class TestPtyWebSocket:
         assert exc.value.code == 4400
 
 
+@skip_on_windows
+class TestPtySurvival:
+    @pytest.fixture(autouse=True)
+    def _setup(self, monkeypatch, _isolate_hermes_home):
+        from starlette.testclient import TestClient
+
+        import hermes_cli.web_server as ws
+
+        self.ws_module = ws
+        monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+        monkeypatch.setenv("HERMES_PTY_RECONNECT_GRACE_SECONDS", "0.2")
+        self.token = ws._SESSION_TOKEN
+        with TestClient(ws.app) as client:
+            self.client = client
+            self._clear_registry()
+            yield
+            self._clear_registry()
+
+    def _clear_registry(self):
+        for session in list(self.ws_module._PTY_BY_CHANNEL.values()):
+            if session.eviction_task and not session.eviction_task.done():
+                session.eviction_task.cancel()
+            session.bridge.close()
+        self.ws_module._PTY_BY_CHANNEL.clear()
+
+    def _url(self, channel: str) -> str:
+        from urllib.parse import urlencode
+
+        return f"/api/pty?{urlencode({'token': self.token, 'channel': channel})}"
+
+    def _wait_for(self, predicate, timeout: float = 2.0):
+        import time
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            value = predicate()
+            if value:
+                return value
+            time.sleep(0.01)
+        raise AssertionError("condition not reached before timeout")
+
+    def _recv_until(self, conn, needle: bytes, timeout: float = 2.0) -> bytes:
+        import queue
+        import threading
+        import time
+
+        buf = bytearray()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            recv_q: queue.Queue = queue.Queue()
+
+            def _recv():
+                try:
+                    recv_q.put(conn.receive_bytes())
+                except Exception as exc:
+                    recv_q.put(exc)
+
+            thread = threading.Thread(target=_recv, daemon=True)
+            thread.start()
+            try:
+                frame = recv_q.get(timeout=max(0.01, deadline - time.monotonic()))
+            except queue.Empty:
+                break
+            if isinstance(frame, Exception):
+                raise frame
+            buf.extend(frame)
+            if needle in buf:
+                break
+        return bytes(buf)
+
+    def _echo_argv(self):
+        return (
+            [
+                "/bin/sh",
+                "-c",
+                "while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done",
+            ],
+            None,
+            None,
+        )
+
+    def test_pty_survival_reattach_same_channel_reuses_pty(self, monkeypatch):
+        monkeypatch.setattr(
+            self.ws_module,
+            "_resolve_chat_argv",
+            lambda resume=None, sidecar_url=None: self._echo_argv(),
+        )
+
+        with self.client.websocket_connect(self._url("survive-same")) as conn:
+            conn.send_bytes(b"first\n")
+            assert b"got:first" in self._recv_until(conn, b"got:first")
+            first_pid = self.ws_module._PTY_BY_CHANNEL["survive-same"].bridge.pid
+
+        self._wait_for(
+            lambda: not self.ws_module._PTY_BY_CHANNEL["survive-same"].attached
+        )
+
+        with self.client.websocket_connect(self._url("survive-same")) as conn:
+            second_pid = self.ws_module._PTY_BY_CHANNEL["survive-same"].bridge.pid
+            assert conn is not None
+
+        assert second_pid == first_pid
+
+    def test_pty_grace_evicts_after_timeout(self, monkeypatch):
+        monkeypatch.setattr(
+            self.ws_module,
+            "_resolve_chat_argv",
+            lambda resume=None, sidecar_url=None: self._echo_argv(),
+        )
+
+        with self.client.websocket_connect(self._url("grace-evict")):
+            bridge = self.ws_module._PTY_BY_CHANNEL["grace-evict"].bridge
+
+        self._wait_for(
+            lambda: "grace-evict" not in self.ws_module._PTY_BY_CHANNEL,
+            timeout=3.0,
+        )
+        assert not bridge.is_alive()
+
+    def test_pty_reattach_replays_scrollback(self, monkeypatch):
+        monkeypatch.setattr(
+            self.ws_module,
+            "_resolve_chat_argv",
+            lambda resume=None, sidecar_url=None: self._echo_argv(),
+        )
+
+        with self.client.websocket_connect(self._url("replay-scrollback")) as conn:
+            conn.send_bytes(b"replay-me\n")
+            assert b"got:replay-me" in self._recv_until(conn, b"got:replay-me")
+
+        self._wait_for(
+            lambda: not self.ws_module._PTY_BY_CHANNEL["replay-scrollback"].attached
+        )
+
+        with self.client.websocket_connect(self._url("replay-scrollback")) as conn:
+            replay = self._recv_until(conn, b"[reconnected]")
+
+        assert b"got:replay-me" in replay
+        assert b"[reconnected]" in replay
+
+    def test_pty_second_concurrent_attach_rejected(self, monkeypatch):
+        from starlette.websockets import WebSocketDisconnect
+
+        monkeypatch.setattr(
+            self.ws_module,
+            "_resolve_chat_argv",
+            lambda resume=None, sidecar_url=None: self._echo_argv(),
+        )
+
+        with self.client.websocket_connect(self._url("conflict")):
+            with pytest.raises(WebSocketDisconnect) as exc:
+                with self.client.websocket_connect(self._url("conflict")) as second:
+                    second.receive_bytes()
+                    second.receive_bytes()
+            assert exc.value.code == 4409
+
+
 class TestDashboardPluginStaticAssetAllowlist:
     """``/dashboard-plugins/<name>/<path>`` is unauthenticated by design —
     the SPA loads plugin JS via ``<script src>`` and CSS via
@@ -2443,4 +2600,3 @@ class TestDashboardPluginStaticAssetAllowlist:
         # 403 traversal-blocked OR 404 (depending on URL decode order)
         # — never 200.
         assert resp.status_code in (403, 404)
-

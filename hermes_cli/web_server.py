@@ -23,6 +23,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -3368,9 +3369,87 @@ except ImportError as _pty_import_err:  # pragma: no cover - Windows-only path
 _RESIZE_RE = re.compile(rb"\x1b\[RESIZE:(\d+);(\d+)\]")
 _PTY_READ_CHUNK_TIMEOUT = 0.2
 _VALID_CHANNEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+_PTY_RECONNECT_GRACE_ENV = "HERMES_PTY_RECONNECT_GRACE_SECONDS"
+_PTY_RECONNECT_GRACE_DEFAULT = 300.0
+_PTY_RECONNECT_GRACE_MAX = 3600.0
+_PTY_RECONNECT_MARKER = b"\r\n\x1b[90m[reconnected]\x1b[0m\r\n"
+
+
+@dataclass
+class _PtySession:
+    bridge: Any
+    argv: List[str]
+    cwd: Optional[str]
+    env: Optional[dict]
+    created_at: float
+    last_attached_at: float
+    attached: bool = False
+    subscribers: int = 0
+    eviction_task: Optional[asyncio.Task] = None
+
+
+_PTY_BY_CHANNEL: dict[str, _PtySession] = {}
+_PTY_REGISTRY_LOCK = asyncio.Lock()
+
 # Starlette's TestClient reports the peer as "testclient"; treat it as
 # loopback so tests don't need to rewrite request scope.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "testclient"})
+
+
+def _pty_reconnect_grace_seconds() -> float:
+    raw = os.environ.get(_PTY_RECONNECT_GRACE_ENV)
+    if raw is None:
+        return _PTY_RECONNECT_GRACE_DEFAULT
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return _PTY_RECONNECT_GRACE_DEFAULT
+    return max(0.0, min(value, _PTY_RECONNECT_GRACE_MAX))
+
+
+async def _evict_after_grace(channel: str, last_attached_at: float, grace_seconds: float) -> None:
+    await asyncio.sleep(grace_seconds)
+    async with _PTY_REGISTRY_LOCK:
+        session = _PTY_BY_CHANNEL.get(channel)
+        if (
+            session is None
+            or session.attached
+            or session.last_attached_at != last_attached_at
+        ):
+            return
+        _PTY_BY_CHANNEL.pop(channel, None)
+    session.bridge.close()
+
+
+async def _detach_pty_channel(channel: str, bridge: Any) -> None:
+    async with _PTY_REGISTRY_LOCK:
+        session = _PTY_BY_CHANNEL.get(channel)
+        if session is None or session.bridge is not bridge:
+            return
+        session.attached = False
+        session.subscribers = 0
+        session.last_attached_at = time.monotonic()
+        if session.eviction_task and not session.eviction_task.done():
+            session.eviction_task.cancel()
+        loop = asyncio.get_running_loop()
+        session.eviction_task = loop.create_task(
+            _evict_after_grace(
+                channel,
+                session.last_attached_at,
+                _pty_reconnect_grace_seconds(),
+            )
+        )
+
+
+@app.on_event("shutdown")
+async def _close_dashboard_pty_sessions() -> None:
+    async with _PTY_REGISTRY_LOCK:
+        sessions = list(_PTY_BY_CHANNEL.values())
+        _PTY_BY_CHANNEL.clear()
+    for session in sessions:
+        if session.eviction_task and not session.eviction_task.done():
+            session.eviction_task.cancel()
+        session.bridge.close()
 
 
 def _ws_client_is_allowed(ws: "WebSocket") -> bool:
@@ -3611,32 +3690,99 @@ async def pty_ws(ws: WebSocket) -> None:
         await ws.close(code=1011)
         return
 
-    # --- spawn PTY ------------------------------------------------------
+    # --- attach/spawn PTY -----------------------------------------------
+    # Browser disconnects detach the PTY instead of killing it. Reconnects
+    # with the same `channel` within HERMES_PTY_RECONNECT_GRACE_SECONDS
+    # (default 300s, capped at 3600s) reattach and replay scrollback.
     resume = ws.query_params.get("resume") or None
     channel = _channel_or_close_code(ws)
     sidecar_url = _build_sidecar_url(channel) if channel else None
+    bridge = None
+    retain_after_disconnect = False
+    reattached = False
 
-    try:
-        argv, cwd, env = _resolve_chat_argv(resume=resume, sidecar_url=sidecar_url)
-    except SystemExit as exc:
-        # _make_tui_argv calls sys.exit(1) when node/npm is missing.
-        await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
-        await ws.close(code=1011)
-        return
+    if channel:
+        async with _PTY_REGISTRY_LOCK:
+            session = _PTY_BY_CHANNEL.get(channel)
+            if session is not None and not session.bridge.is_alive():
+                if session.eviction_task and not session.eviction_task.done():
+                    session.eviction_task.cancel()
+                _PTY_BY_CHANNEL.pop(channel, None)
+                session.bridge.close()
+                session = None
+            if session is not None and session.attached:
+                await ws.send_bytes(
+                    b"\r\n\x1b[31m[chat already attached in another tab]\x1b[0m\r\n"
+                )
+                await ws.close(code=4409)
+                return
+            if session is not None:
+                if session.eviction_task and not session.eviction_task.done():
+                    session.eviction_task.cancel()
+                session.eviction_task = None
+                session.attached = True
+                session.subscribers = 1
+                session.last_attached_at = time.monotonic()
+                bridge = session.bridge
+                retain_after_disconnect = True
+                reattached = True
 
+    if bridge is None:
+        try:
+            argv, cwd, env = _resolve_chat_argv(resume=resume, sidecar_url=sidecar_url)
+        except SystemExit as exc:
+            # _make_tui_argv calls sys.exit(1) when node/npm is missing.
+            await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
+            await ws.close(code=1011)
+            return
 
-    try:
-        bridge = PtyBridge.spawn(argv, cwd=cwd, env=env)
-    except PtyUnavailableError as exc:
-        await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
-        await ws.close(code=1011)
-        return
-    except (FileNotFoundError, OSError) as exc:
-        await ws.send_text(f"\r\n\x1b[31mChat failed to start: {exc}\x1b[0m\r\n")
-        await ws.close(code=1011)
-        return
+        try:
+            bridge = PtyBridge.spawn(argv, cwd=cwd, env=env)
+        except PtyUnavailableError as exc:
+            await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
+            await ws.close(code=1011)
+            return
+        except (FileNotFoundError, OSError) as exc:
+            await ws.send_text(f"\r\n\x1b[31mChat failed to start: {exc}\x1b[0m\r\n")
+            await ws.close(code=1011)
+            return
+
+        if channel:
+            now = time.monotonic()
+            session = _PtySession(
+                bridge=bridge,
+                argv=list(argv),
+                cwd=cwd,
+                env=env,
+                created_at=now,
+                last_attached_at=now,
+                attached=True,
+                subscribers=1,
+            )
+            async with _PTY_REGISTRY_LOCK:
+                previous = _PTY_BY_CHANNEL.get(channel)
+                if previous is not None and previous.attached:
+                    bridge.close()
+                    await ws.send_bytes(
+                        b"\r\n\x1b[31m[chat already attached in another tab]\x1b[0m\r\n"
+                    )
+                    await ws.close(code=4409)
+                    return
+                if previous is not None:
+                    if previous.eviction_task and not previous.eviction_task.done():
+                        previous.eviction_task.cancel()
+                    previous.bridge.close()
+                _PTY_BY_CHANNEL[channel] = session
+            retain_after_disconnect = True
 
     loop = asyncio.get_running_loop()
+
+    if reattached:
+        replay = bridge.snapshot_scrollback()
+        if replay:
+            await ws.send_bytes(b"\x1b[2J\x1b[H")
+            await ws.send_bytes(replay)
+            await ws.send_bytes(_PTY_RECONNECT_MARKER)
 
     # --- reader task: PTY master → WebSocket ----------------------------
     async def pump_pty_to_ws() -> None:
@@ -3687,7 +3833,10 @@ async def pty_ws(ws: WebSocket) -> None:
             await reader_task
         except (asyncio.CancelledError, Exception):
             pass
-        bridge.close()
+        if retain_after_disconnect and channel:
+            await _detach_pty_channel(channel, bridge)
+        else:
+            bridge.close()
 
 
 # ---------------------------------------------------------------------------

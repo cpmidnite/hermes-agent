@@ -51,15 +51,65 @@ function buildWsUrl(
   return `${proto}//${window.location.host}${HERMES_BASE_PATH}/api/pty?${qs.toString()}`;
 }
 
-// Channel id ties this chat tab's PTY child (publisher) to its sidebar
-// (subscriber).  Generated once per mount so a tab refresh starts a fresh
-// channel — the previous PTY child terminates with the old WS, and its
-// channel auto-evicts when no subscribers remain.
+const CHANNEL_STORAGE_KEY = "hermes.chat.channel";
+const CHANNEL_RESUME_STORAGE_KEY = "hermes.chat.channel_resume";
+const LAST_SESSION_STORAGE_KEY = "hermes.chat.last_session_id";
+const CHANNEL_RE = /^[A-Za-z0-9._-]{1,128}$/;
+
 function generateChannelId(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
     return crypto.randomUUID();
   }
   return `chat-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
+}
+
+function readLocalStorage(key: string): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeLocalStorage(key: string, value: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    // Private browsing and locked-down storage should fall back to ephemeral ids.
+  }
+}
+
+function removeLocalStorage(key: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.removeItem(key);
+  } catch {
+    // Best effort only.
+  }
+}
+
+function storedChannelForResume(resume: string | null): string {
+  const previousResume = readLocalStorage(CHANNEL_RESUME_STORAGE_KEY);
+  const stored = readLocalStorage(CHANNEL_STORAGE_KEY);
+  if (resume && stored && previousResume !== resume) {
+    removeLocalStorage(CHANNEL_STORAGE_KEY);
+    const next = generateChannelId();
+    writeLocalStorage(CHANNEL_STORAGE_KEY, next);
+    writeLocalStorage(CHANNEL_RESUME_STORAGE_KEY, resume);
+    return next;
+  }
+
+  if (stored && CHANNEL_RE.test(stored)) {
+    writeLocalStorage(CHANNEL_RESUME_STORAGE_KEY, resume ?? "");
+    return stored;
+  }
+
+  const next = generateChannelId();
+  writeLocalStorage(CHANNEL_STORAGE_KEY, next);
+  writeLocalStorage(CHANNEL_RESUME_STORAGE_KEY, resume ?? "");
+  return next;
 }
 
 // Colors for the terminal body.  Matches the dashboard's dark teal canvas
@@ -159,17 +209,32 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // treat the current resume target as part of the PTY identity and rebuild the
   // terminal session when it changes.
   const resumeParam = searchParams.get("resume");
-  const channel = useMemo(() => generateChannelId(), [resumeParam]);
+  const storedLastSessionId = useMemo(() => {
+    if (typeof window === "undefined") return null;
+    return readLocalStorage(LAST_SESSION_STORAGE_KEY);
+  }, []);
+  const activeResumeParam = resumeParam || storedLastSessionId;
+  const channel = useMemo(
+    () => storedChannelForResume(activeResumeParam),
+    [activeResumeParam],
+  );
 
   useEffect(() => {
-    if (!resumeParam) return;
+    if (resumeParam || !storedLastSessionId) return;
+    const next = new URLSearchParams(searchParams);
+    next.set("resume", storedLastSessionId);
+    setSearchParams(next, { replace: true });
+  }, [resumeParam, searchParams, setSearchParams, storedLastSessionId]);
+
+  useEffect(() => {
+    if (!activeResumeParam) return;
 
     let cancelled = false;
 
     api
-      .getSessionLatestDescendant(resumeParam)
+      .getSessionLatestDescendant(activeResumeParam)
       .then((res) => {
-        if (cancelled || !res.session_id || res.session_id === resumeParam) {
+        if (cancelled || !res.session_id || res.session_id === activeResumeParam) {
           return;
         }
 
@@ -184,7 +249,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     return () => {
       cancelled = true;
     };
-  }, [resumeParam, searchParams, setSearchParams]);
+  }, [activeResumeParam, searchParams, setSearchParams]);
 
   useEffect(() => {
     const mql = window.matchMedia("(max-width: 1023px)");
@@ -559,13 +624,16 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     void (async () => {
       const authParam = await buildWsAuthParam();
       if (unmounting) return;
-      const url = buildWsUrl(authParam, resumeParam, channel);
+      const url = buildWsUrl(authParam, activeResumeParam, channel);
       const ws = new WebSocket(url);
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;
 
     ws.onopen = () => {
       setBanner(null);
+      if (activeResumeParam) {
+        writeLocalStorage(LAST_SESSION_STORAGE_KEY, activeResumeParam);
+      }
       // Send the initial RESIZE immediately so Ink has *a* size to lay
       // out against on its first paint.  The double-rAF block above will
       // follow up with the authoritative measurement — at worst Ink
@@ -666,7 +734,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         copyResetRef.current = null;
       }
     };
-  }, [channel, resumeParam]);
+  }, [channel, activeResumeParam]);
 
   // When the user returns to the chat tab (isActive: false → true), the
   // terminal host just transitioned from display:none to display:flex.
