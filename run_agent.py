@@ -1179,9 +1179,12 @@ class AIAgent:
     ) -> bool:
         """Return True when this provider/model pair should use Responses API."""
         normalized_provider = (provider or "").strip().lower()
-        # Nous serves GPT-5.x models via its OpenAI-compatible chat
-        # completions endpoint; its /v1/responses endpoint returns 404.
-        if normalized_provider == "nous":
+        # OpenAI-compatible routers/custom providers can expose GPT-5.x slugs
+        # through Chat Completions only. Do not force Responses API for them;
+        # callers already separately enable Responses for direct OpenAI URLs.
+        # This keeps automatic fallback behavior aligned with manual /model
+        # switching for 9Router/local custom providers.
+        if normalized_provider in {"nous", "custom"}:
             return False
         if normalized_provider == "copilot":
             try:

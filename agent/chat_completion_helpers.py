@@ -940,6 +940,12 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     if assistant_tool_calls:
         tool_calls = []
         for tool_call in assistant_tool_calls:
+            if tool_call is None:
+                # Some OpenAI-compatible routers can surface null entries in
+                # message.tool_calls (seen with 9Router cx/gpt-5.5 fallback).
+                # Ignore malformed placeholders instead of crashing the whole
+                # fallback turn with "'NoneType' object has no attribute 'type'".
+                continue
             raw_id = getattr(tool_call, "id", None)
             call_id = getattr(tool_call, "call_id", None)
             if not isinstance(call_id, str) or not call_id.strip():
@@ -965,14 +971,22 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
                 response_item_id if isinstance(response_item_id, str) else None,
             )
 
+            _fn = getattr(tool_call, "function", None)
+            _fn_name = getattr(_fn, "name", "") if _fn else ""
+            _fn_args = getattr(_fn, "arguments", "{}") if _fn else "{}"
+            if not _fn_name:
+                # Malformed tool-call entry without a function payload. Treat
+                # it as router noise and continue; content/reasoning still
+                # gets delivered when no valid tool calls remain.
+                continue
             tc_dict = {
                 "id": call_id,
                 "call_id": call_id,
                 "response_item_id": response_item_id,
-                "type": tool_call.type,
+                "type": getattr(tool_call, "type", None) or "function",
                 "function": {
-                    "name": tool_call.function.name,
-                    "arguments": tool_call.function.arguments
+                    "name": _fn_name,
+                    "arguments": _fn_args,
                 },
             }
             # Defence-in-depth: redact credentials from tool call arguments

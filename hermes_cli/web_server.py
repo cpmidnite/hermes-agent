@@ -6140,13 +6140,11 @@ def _ws_client_is_allowed(ws: "WebSocket") -> bool:
     """
     if getattr(app.state, "auth_required", False):
         return True
-    # Any explicit non-loopback bind (0.0.0.0, ::, or a specific LAN /
-    # Tailscale address) means the operator opted into non-loopback
-    # access via --insecure.  The loopback-only peer gate only applies to
-    # an actual loopback bind; otherwise the WS handshake is rejected even
-    # though same-bind HTTP requests pass _is_accepted_host.
-    bound_host = (getattr(app.state, "bound_host", "") or "").strip().lower()
-    if bound_host and bound_host not in _LOOPBACK_HOSTS:
+    # --insecure bind on non-loopback host: operator opted into LAN/tailnet
+    # exposure with the legacy ?token=<_SESSION_TOKEN> auth. Allow remote WS
+    # clients to match the REST behaviour; the Host/Origin guard still
+    # blocks DNS-rebinding.
+    if getattr(app.state, "allow_public", False):
         return True
     client_host = ws.client.host if ws.client else ""
     if not client_host:
@@ -7753,6 +7751,7 @@ def start_server(
     # uses this to decide whether to refuse the bind, log the gate-on
     # banner, and enable uvicorn proxy_headers.
     app.state.auth_required = should_require_auth(host, allow_public)
+    app.state.allow_public = allow_public
 
     if app.state.auth_required:
         # Phase 3.5: the gate engages on non-loopback binds.  The legacy
