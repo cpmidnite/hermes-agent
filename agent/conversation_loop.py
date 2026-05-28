@@ -1943,6 +1943,8 @@ def run_conversation(
                 break
 
             except Exception as api_error:
+                if isinstance(api_error, AttributeError) and "object has no attribute 'type'" in str(api_error):
+                    logging.exception("AttributeError .type during API call/fallback normalization")
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
                 if thinking_spinner:

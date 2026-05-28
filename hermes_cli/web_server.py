@@ -3469,6 +3469,12 @@ def _ws_client_is_allowed(ws: "WebSocket") -> bool:
     """
     if getattr(app.state, "auth_required", False):
         return True
+    # --insecure bind on non-loopback host: operator opted into LAN/tailnet
+    # exposure with the legacy ?token=<_SESSION_TOKEN> auth. Allow remote WS
+    # clients to match the REST behaviour; the Host/Origin guard still
+    # blocks DNS-rebinding.
+    if getattr(app.state, "allow_public", False):
+        return True
     client_host = ws.client.host if ws.client else ""
     if not client_host:
         return True
@@ -4993,6 +4999,7 @@ def start_server(
     # uses this to decide whether to refuse the bind, log the gate-on
     # banner, and enable uvicorn proxy_headers.
     app.state.auth_required = should_require_auth(host, allow_public)
+    app.state.allow_public = allow_public
 
     if app.state.auth_required:
         # Phase 3.5: the gate engages on non-loopback binds.  The legacy
