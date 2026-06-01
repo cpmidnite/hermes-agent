@@ -145,6 +145,19 @@ export function useVirtualHistory(
   // Height cache writes happen in layout effects; bump once so offsets and
   // clamp bounds rebuild without waiting for the next scroll/input event.
   const [measuredHeightVersion, bumpMeasuredHeightVersion] = useState(0)
+  // Re-entrancy guard for the measure→bump convergence loop in the layout
+  // effect below. Each height-cache change bumps measuredHeightVersion, which
+  // is a dep of that effect, so it re-measures until Yoga heights stabilize
+  // (normally 1-2 passes). Under a browser-PTY resize STORM (xterm.js fit-addon
+  // emits rapid resize bursts that arrive as stdout.columns writes), each burst
+  // invalidates the height cache mid-convergence so heights never settle within
+  // React's 25-rerender budget → React #301 ("too many re-renders"). This
+  // counter caps synchronous bumps per real layout change; past the cap we
+  // defer the bump to a fresh task so the convergence happens outside the
+  // synchronous render phase. Reset when the measurement INPUTS change (a real
+  // layout change), not on our own self-induced bumps.
+  const measureBumpCount = useRef(0)
+  const MAX_SYNC_MEASURE_BUMPS = 8
   const metrics = useRef({ sticky: true, top: 0, vp: 0 })
   const lastScrollTopRef = useRef(0)
 
@@ -179,6 +192,8 @@ export function useVirtualHistory(
     offsetVersion.current++
     skipMeasurement.current = true
     freezeRenders.current = FREEZE_RENDERS
+    // Real layout change (column resize) → allow a fresh convergence budget.
+    measureBumpCount.current = 0
   }
 
   useLayoutEffect(() => {
@@ -524,7 +539,26 @@ export function useVirtualHistory(
     }
 
     if (heightDirty) {
-      bumpMeasuredHeightVersion(n => n + 1)
+      // Cap synchronous re-measure bumps. Heights normally converge in 1-2
+      // passes; a resize storm can keep them dirty indefinitely and blow
+      // React's 25-rerender budget (#301). Under the cap, bump synchronously
+      // (fast convergence on the common path). Past the cap, defer to a fresh
+      // task so React commits the current frame first and the storm can settle
+      // — the deferred bump still re-measures, just outside the hot render loop.
+      if (measureBumpCount.current < MAX_SYNC_MEASURE_BUMPS) {
+        measureBumpCount.current++
+        bumpMeasuredHeightVersion(n => n + 1)
+      } else {
+        const t = setTimeout(() => {
+          measureBumpCount.current = 0
+          bumpMeasuredHeightVersion(n => n + 1)
+        }, 0)
+        return () => clearTimeout(t)
+      }
+    } else {
+      // Heights stable this pass → real layout has settled. Refill the budget
+      // so the NEXT genuine change gets a fresh fast-convergence allowance.
+      measureBumpCount.current = 0
     }
   }, [effEnd, effStart, items, liveTailActive, measuredHeightVersion, n, offsets, scrollRef, sticky, total, vp])
 
