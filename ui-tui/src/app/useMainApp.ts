@@ -144,7 +144,21 @@ export function useMainApp(gw: GatewayClient) {
       return
     }
 
-    const sync = () => setCols(stdout.columns ?? 80)
+    // Coalesce resize bursts. Some terminals (notably cmux/libghostty panes
+    // while a split layout settles) fire a SIGWINCH storm. An unguarded
+    // setCols per event remounts every transcript row (key embeds `cols`),
+    // and the remount can re-trigger a measured resize → render-phase update
+    // loop → React #301 ("too many re-renders"). Debounce + skip no-op
+    // updates so a burst collapses into a single state change.
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const sync = () => {
+      clearTimeout(timer)
+      timer = setTimeout(() => {
+        timer = undefined
+        const next = stdout.columns ?? 80
+        setCols(prev => (prev === next ? prev : next))
+      }, 50)
+    }
 
     stdout.on('resize', sync)
 
@@ -153,6 +167,7 @@ export function useMainApp(gw: GatewayClient) {
     }
 
     return () => {
+      clearTimeout(timer)
       stdout.off('resize', sync)
 
       if (stdout.isTTY) {
