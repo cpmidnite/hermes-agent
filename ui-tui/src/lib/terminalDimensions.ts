@@ -96,12 +96,35 @@ export function clampStdoutDimensions(stream: ClampableStream = process.stdout):
   const readCols = () => (colsDesc ? readValue(target, colsDesc) : target.columns)
   const readRows = () => (rowsDesc ? readValue(target, rowsDesc) : target.rows)
 
+  // Node's own SIGWINCH handler WRITES `stdout.columns`/`stdout.rows` on resize.
+  // If we redefine these as getter-only, that write throws
+  // "Cannot set property columns of #<WriteStream> which has only a getter"
+  // and crashes the render on the first resize event (tmux/cmux fire these
+  // constantly). Forward writes to the original descriptor so resizes keep
+  // working while reads stay clamped. Fall back to a backing field for exotic
+  // streams whose original descriptor is neither a setter nor writable data.
+  let colsBacking = readCols()
+  let rowsBacking = readRows()
+  const writeThrough = (desc: PropertyDescriptor | undefined, value: unknown, fallback: (v: unknown) => void) => {
+    if (desc && desc.set) {
+      desc.set.call(target, value)
+    } else if (desc && 'value' in desc && desc.writable !== false) {
+      desc.value = value
+    } else {
+      fallback(value)
+    }
+  }
+
   try {
     Object.defineProperty(target, 'columns', {
       configurable: true,
       enumerable: true,
       get() {
         return sanitizeDimension(readCols(), MIN_COLUMNS, MAX_COLUMNS, DEFAULT_COLUMNS)
+      },
+      set(value: unknown) {
+        colsBacking = value
+        writeThrough(colsDesc, value, v => { colsBacking = v })
       }
     })
     Object.defineProperty(target, 'rows', {
@@ -109,6 +132,10 @@ export function clampStdoutDimensions(stream: ClampableStream = process.stdout):
       enumerable: true,
       get() {
         return sanitizeDimension(readRows(), MIN_ROWS, MAX_ROWS, DEFAULT_ROWS)
+      },
+      set(value: unknown) {
+        rowsBacking = value
+        writeThrough(rowsDesc, value, v => { rowsBacking = v })
       }
     })
     target[PATCHED] = true

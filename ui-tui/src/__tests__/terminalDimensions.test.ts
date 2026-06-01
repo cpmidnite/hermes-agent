@@ -105,4 +105,39 @@ describe('clampStdoutDimensions', () => {
 
     expect(() => clampStdoutDimensions(stream)).not.toThrow()
   })
+
+  it('forwards writes to a writable data property (Node SIGWINCH resize)', () => {
+    // Real WriteStream.columns is a writable data property that Node's own
+    // resize handler assigns to. The clamp must keep that write working —
+    // otherwise the first resize throws "Cannot set property columns of
+    // #<WriteStream> which has only a getter" and crashes the render.
+    const stream: { columns?: number; rows?: number } = { columns: 80, rows: 24 }
+
+    clampStdoutDimensions(stream)
+
+    expect(() => { stream.columns = 120 }).not.toThrow()
+    expect(() => { stream.rows = 40 }).not.toThrow()
+    expect(stream.columns).toBe(120)
+    expect(stream.rows).toBe(40)
+
+    // An oversized resize write is still read back clamped.
+    stream.columns = 131072
+    expect(stream.columns).toBe(MAX_COLUMNS)
+  })
+
+  it('forwards writes through an original setter', () => {
+    let backing = 80
+    const stream: { columns?: number; rows?: number } = { rows: 24 }
+    Object.defineProperty(stream, 'columns', {
+      configurable: true,
+      get: () => backing,
+      set: (v: number) => { backing = v }
+    })
+
+    clampStdoutDimensions(stream)
+
+    expect(() => { stream.columns = 120 }).not.toThrow()
+    expect(backing).toBe(120)
+    expect(stream.columns).toBe(120)
+  })
 })
