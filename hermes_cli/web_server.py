@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import secrets
+import shutil
 import stat
 import subprocess
 import sys
@@ -26,6 +27,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -6102,7 +6104,11 @@ except ImportError as _pty_import_err:  # pragma: no cover - Windows-only path
 
 _RESIZE_RE = re.compile(rb"\x1b\[RESIZE:(\d+);(\d+)\]")
 _PTY_READ_CHUNK_TIMEOUT = 0.2
+_PTY_REPLAY_BUFFER_BYTES = 4 * 1024 * 1024
+_PTY_IDLE_TTL_SECONDS = 24 * 60 * 60
 _VALID_CHANNEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+_PTY_SESSIONS: dict[str, "PersistentPtySession"] = {}
+_PTY_SESSIONS_LOCK = asyncio.Lock()
 # Starlette's TestClient reports the peer as "testclient"; treat it as
 # loopback so tests don't need to rewrite request scope.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "testclient"})
@@ -6287,10 +6293,40 @@ def _resolve_chat_argv(
     if sidecar_url:
         env["HERMES_TUI_SIDECAR_URL"] = sidecar_url
 
-    if gateway_ws_url := _build_gateway_ws_url():
-        env["HERMES_TUI_GATEWAY_URL"] = gateway_ws_url
+    # Do not force the embedded TUI to attach to the dashboard's in-process
+    # JSON-RPC websocket. If that sidecar attach fails, the browser terminal
+    # paints "gateway exited" even though the PTY child is alive. Let the TUI
+    # use its normal stdio gateway path, matching `hermes --tui`.
+    #
+    # if gateway_ws_url := _build_gateway_ws_url():
+    #     env["HERMES_TUI_GATEWAY_URL"] = gateway_ws_url
+
+    # Strong persistence for browser chat: keep the real TUI/agent inside tmux.
+    # The websocket PTY only attaches to tmux, so tab sleep, network drops,
+    # dashboard restarts, and deploy restarts do not kill the task. If tmux is
+    # unavailable, fall back to the in-process persistent PTY below.
+    if shutil.which("tmux"):
+        tmux_name = "hermes-browser-chat"
+        if not _tmux_session_exists(tmux_name):
+            subprocess.run(
+                ["tmux", "new-session", "-d", "-s", tmux_name, "-c", str(cwd) if cwd else os.getcwd(), *map(str, argv)],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        return ["tmux", "attach-session", "-t", tmux_name], str(cwd) if cwd else None, env
 
     return list(argv), str(cwd) if cwd else None, env
+
+
+def _tmux_session_exists(name: str) -> bool:
+    return subprocess.run(
+        ["tmux", "has-session", "-t", name],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).returncode == 0
 
 
 def _build_gateway_ws_url() -> Optional[str]:
@@ -6368,6 +6404,100 @@ def _channel_or_close_code(ws: WebSocket) -> Optional[str]:
     return channel if _VALID_CHANNEL_RE.match(channel) else None
 
 
+class PersistentPtySession:
+    """Server-owned PTY that survives browser websocket disconnects."""
+
+    def __init__(self, key: str, bridge: "PtyBridge") -> None:
+        self.key = key
+        self.bridge = bridge
+        self.clients: set[Any] = set()
+        self.buffer: deque[bytes] = deque()
+        self.buffer_bytes = 0
+        self.last_detached_at: float | None = None
+        self.reader_task: asyncio.Task | None = None
+        self.cleanup_task: asyncio.Task | None = None
+        self.lock = asyncio.Lock()
+
+    def start(self) -> None:
+        if self.reader_task is None or self.reader_task.done():
+            self.reader_task = asyncio.create_task(self._reader_loop())
+
+    def append_output(self, chunk: bytes) -> None:
+        self.buffer.append(chunk)
+        self.buffer_bytes += len(chunk)
+        while self.buffer_bytes > _PTY_REPLAY_BUFFER_BYTES and self.buffer:
+            self.buffer_bytes -= len(self.buffer.popleft())
+
+    async def _reader_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        try:
+            while True:
+                chunk = await loop.run_in_executor(None, self.bridge.read, _PTY_READ_CHUNK_TIMEOUT)
+                if chunk is None:
+                    break
+                if not chunk:
+                    await asyncio.sleep(0)
+                    continue
+                async with self.lock:
+                    self.append_output(chunk)
+                    clients = list(self.clients)
+                for client in clients:
+                    try:
+                        await client.send_bytes(chunk)
+                    except Exception:
+                        async with self.lock:
+                            self.clients.discard(client)
+        finally:
+            await self.close(remove=True)
+
+    async def attach(self, ws: WebSocket) -> None:
+        async with self.lock:
+            self.clients.add(ws)
+            self.last_detached_at = None
+            replay = list(self.buffer)
+        for chunk in replay:
+            await ws.send_bytes(chunk)
+
+    async def detach(self, ws: WebSocket) -> None:
+        async with self.lock:
+            self.clients.discard(ws)
+            if not self.clients:
+                self.last_detached_at = time.monotonic()
+                if self.cleanup_task is None or self.cleanup_task.done():
+                    self.cleanup_task = asyncio.create_task(self._idle_cleanup())
+
+    async def _idle_cleanup(self) -> None:
+        await asyncio.sleep(_PTY_IDLE_TTL_SECONDS)
+        async with self.lock:
+            idle_since = self.last_detached_at
+            has_clients = bool(self.clients)
+        if has_clients or idle_since is None:
+            return
+        if time.monotonic() - idle_since >= _PTY_IDLE_TTL_SECONDS:
+            await self.close(remove=True)
+
+    async def close(self, *, remove: bool = False) -> None:
+        self.bridge.close()
+        if remove:
+            async with _PTY_SESSIONS_LOCK:
+                if _PTY_SESSIONS.get(self.key) is self:
+                    _PTY_SESSIONS.pop(self.key, None)
+
+
+async def _get_or_create_pty_session(key: str, argv: list[str], cwd: str | None, env: dict | None) -> PersistentPtySession:
+    async with _PTY_SESSIONS_LOCK:
+        existing = _PTY_SESSIONS.get(key)
+        if existing and existing.bridge.is_alive():
+            return existing
+        if PtyBridge is None:
+            raise PtyUnavailableError("Pseudo-terminals are unavailable.")
+        bridge = PtyBridge.spawn(argv, cwd=cwd, env=env)
+        session = PersistentPtySession(key, bridge)
+        _PTY_SESSIONS[key] = session
+        session.start()
+        return session
+
+
 @app.websocket("/api/pty")
 async def pty_ws(ws: WebSocket) -> None:
     if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
@@ -6410,9 +6540,14 @@ async def pty_ws(ws: WebSocket) -> None:
         await ws.close(code=1011)
         return
 
+    pty_session_key = ws.query_params.get("pty_session") or "default"
+    if not _VALID_CHANNEL_RE.match(pty_session_key):
+        await ws.send_text("\r\n\x1b[31mChat failed to start: invalid pty_session\x1b[0m\r\n")
+        await ws.close(code=1008)
+        return
 
     try:
-        bridge = PtyBridge.spawn(argv, cwd=cwd, env=env)
+        pty_session = await _get_or_create_pty_session(pty_session_key, argv, cwd, env)
     except PtyUnavailableError as exc:
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
         await ws.close(code=1011)
@@ -6422,27 +6557,9 @@ async def pty_ws(ws: WebSocket) -> None:
         await ws.close(code=1011)
         return
 
-    loop = asyncio.get_running_loop()
+    await pty_session.attach(ws)
 
-    # --- reader task: PTY master → WebSocket ----------------------------
-    async def pump_pty_to_ws() -> None:
-        while True:
-            chunk = await loop.run_in_executor(
-                None, bridge.read, _PTY_READ_CHUNK_TIMEOUT
-            )
-            if chunk is None:  # EOF
-                return
-            if not chunk:  # no data this tick; yield control and retry
-                await asyncio.sleep(0)
-                continue
-            try:
-                await ws.send_bytes(chunk)
-            except Exception:
-                return
-
-    reader_task = asyncio.create_task(pump_pty_to_ws())
-
-    # --- writer loop: WebSocket → PTY master ----------------------------
+    # --- writer loop: WebSocket → persistent PTY master ------------------
     try:
         while True:
             msg = await ws.receive()
@@ -6461,19 +6578,14 @@ async def pty_ws(ws: WebSocket) -> None:
             if match and match.end() == len(raw):
                 cols = int(match.group(1))
                 rows = int(match.group(2))
-                bridge.resize(cols=cols, rows=rows)
+                pty_session.bridge.resize(cols=cols, rows=rows)
                 continue
 
-            bridge.write(raw)
+            pty_session.bridge.write(raw)
     except WebSocketDisconnect:
         pass
     finally:
-        reader_task.cancel()
-        try:
-            await reader_task
-        except (asyncio.CancelledError, Exception):
-            pass
-        bridge.close()
+        await pty_session.detach(ws)
 
 
 # ---------------------------------------------------------------------------
