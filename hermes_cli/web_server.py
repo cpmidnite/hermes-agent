@@ -8597,9 +8597,10 @@ def _resolve_chat_argv(
         env["HERMES_TUI_SIDECAR_URL"] = sidecar_url
 
     # Do not force the embedded TUI to attach to the dashboard's in-process
-    # JSON-RPC websocket. If that sidecar attach fails, the browser terminal
-    # paints "gateway exited" even though the PTY child is alive. Let the TUI
-    # use its normal stdio gateway path, matching `hermes --tui`.
+    # JSON-RPC websocket. In the browser PTY path this sidecar attach can wedge
+    # the React/Ink tree (observed as Minified React error #301 / too many
+    # re-renders, and previously as "gateway exited") even though terminal
+    # `hermes --tui` works. Let the TUI use its normal stdio gateway path.
     #
     # if gateway_ws_url := _build_gateway_ws_url():
     #     env["HERMES_TUI_GATEWAY_URL"] = gateway_ws_url
